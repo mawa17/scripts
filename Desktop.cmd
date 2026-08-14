@@ -61,12 +61,15 @@ if (-not (Test-Path -LiteralPath $settingsDirectory)) {
         Out-Null
 }
 
+$classicDesktop = Join-Path $env:USERPROFILE "Desktop"
+
 $defaultSettings = [ordered]@{
     BackgroundType  = "Color"
     BackgroundColor = "#0B0F14"
     ImagePath       = ""
     ImageMode       = "Fill"
     IconScale       = 72
+    DesktopPath     = $classicDesktop
     Positions       = @{}
 }
 
@@ -76,6 +79,7 @@ $settings = [ordered]@{
     ImagePath       = ""
     ImageMode       = "Fill"
     IconScale       = 72
+    DesktopPath     = $classicDesktop
     Positions       = @{}
 }
 
@@ -118,6 +122,10 @@ if (Test-Path -LiteralPath $settingsFile) {
                 }
             }
 
+            if ($null -ne $loaded.DesktopPath) {
+                $settings.DesktopPath = [string]$loaded.DesktopPath
+            }
+
             if ($null -ne $loaded.Positions) {
                 foreach ($p in $loaded.Positions.PSObject.Properties) {
                     try {
@@ -157,6 +165,16 @@ if ([string]::IsNullOrWhiteSpace($settings.BackgroundType)) {
 if ([string]::IsNullOrWhiteSpace($settings.ImageMode)) {
     $settings.ImageMode = "Fill"
 }
+
+if ([string]::IsNullOrWhiteSpace($settings.DesktopPath)) {
+    $settings.DesktopPath = Join-Path $env:USERPROFILE "Desktop"
+}
+
+# Expand any environment variables the user may have typed
+try {
+    $settings.DesktopPath = [Environment]::ExpandEnvironmentVariables($settings.DesktopPath)
+}
+catch { }
 
 # ============================================================
 # 006 - GLOBAL STATE
@@ -211,16 +229,29 @@ $script:Colors = @{
 # 008 - DESKTOP PATH
 # ============================================================
 
-$desktopPath = [Environment]::GetFolderPath(
-    [Environment+SpecialFolder]::Desktop
-)
+# Prefer the path from settings (defaults to C:\Users\%USERNAME%\Desktop).
+# Falls back to the classic user profile Desktop if the configured path is missing.
+$desktopPath = [string]$settings.DesktopPath
 
-if (
-    [string]::IsNullOrWhiteSpace($desktopPath) -or
-    -not (Test-Path -LiteralPath $desktopPath)
-) {
+if ([string]::IsNullOrWhiteSpace($desktopPath)) {
     $desktopPath = Join-Path $env:USERPROFILE "Desktop"
 }
+
+try {
+    $desktopPath = [Environment]::ExpandEnvironmentVariables($desktopPath)
+}
+catch { }
+
+if (-not (Test-Path -LiteralPath $desktopPath)) {
+    # Last-chance fallback
+    $fallback = Join-Path $env:USERPROFILE "Desktop"
+    if (Test-Path -LiteralPath $fallback) {
+        $desktopPath = $fallback
+        $settings.DesktopPath = $fallback
+    }
+}
+
+$script:desktopPath = $desktopPath
 
 # ============================================================
 # 009 - DOUBLE BUFFER
@@ -285,6 +316,7 @@ function Save-DesktopSettings {
             ImagePath       = [string]$settings.ImagePath
             ImageMode       = [string]$settings.ImageMode
             IconScale       = [int]$settings.IconScale
+            DesktopPath     = [string]$settings.DesktopPath
             Positions       = $settings.Positions
         }
 
@@ -494,7 +526,7 @@ function Apply-Background {
 }
 
 # ============================================================
-# 015 - WINDOWS ICON ENGINE
+# 015 - WINDOWS ICON ENGINE (ultra-robust)
 # ============================================================
 
 Add-Type -TypeDefinition @'
@@ -502,17 +534,15 @@ using System;
 using System.Drawing;
 using System.Runtime.InteropServices;
 
-public static class WindowsJumboIcons
+public static class ShellIcons
 {
-    public const int SHIL_JUMBO = 0x4;
-    public const int ILD_TRANSPARENT = 0x00000001;
-    public const int ILD_IMAGE = 0x00000020;
-
-    public const uint SHGFI_SYSICONINDEX = 0x00004000;
+    public const uint SHGFI_ICON      = 0x00000100;
     public const uint SHGFI_LARGEICON = 0x00000000;
+    public const uint SHGFI_SMALLICON = 0x00000001;
+    public const uint SHGFI_USEFILEATTRIBUTES = 0x00000010;
 
-    public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
-    public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    public const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+    public const uint FILE_ATTRIBUTE_NORMAL    = 0x80;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct SHFILEINFO
@@ -520,142 +550,66 @@ public static class WindowsJumboIcons
         public IntPtr hIcon;
         public int iIcon;
         public uint dwAttributes;
-
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
         public string szDisplayName;
-
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
         public string szTypeName;
     }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr SHGetFileInfo(
+    private static extern IntPtr SHGetFileInfo(
         string pszPath,
         uint dwFileAttributes,
-        out SHFILEINFO psfi,
+        ref SHFILEINFO psfi,
         uint cbFileInfo,
-        uint uFlags
-    );
+        uint uFlags);
 
-    [DllImport("shell32.dll", EntryPoint = "#727")]
-    public static extern int SHGetImageList(
-        int iImageList,
-        ref Guid riid,
-        ref IImageList ppv
-    );
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 
-    [DllImport("user32.dll")]
-    public static extern bool DestroyIcon(IntPtr hIcon);
-
-    [ComImport]
-    [Guid("46EB5926-582E-4017-9FDF-E8998DAA0950")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    public interface IImageList
+    public static Bitmap GetIcon(string path, bool isDirectory)
     {
-        [PreserveSig] int Add(IntPtr hbmImage, IntPtr hbmMask, ref int pi);
-        [PreserveSig] int ReplaceIcon(int i, IntPtr hicon, ref int pi);
-        [PreserveSig] int SetOverlayImage(int iImage, int iOverlay);
-        [PreserveSig] int Replace(int i, IntPtr hbmImage, IntPtr hbmMask);
-        [PreserveSig] int AddMasked(IntPtr hbmImage, int crMask, ref int pi);
-        [PreserveSig] int Draw(IntPtr pimldp);
-        [PreserveSig] int Remove(int i);
-        [PreserveSig] int GetIcon(int i, int flags, ref IntPtr picon);
-        [PreserveSig] int GetImageInfo(int i, IntPtr pImageInfo);
-        [PreserveSig] int Copy(int iDst, IImageList punkSrc, int iSrc, int uFlags);
-        [PreserveSig] int Merge(int i1, IImageList punk2, int i2,
-            int dx, int dy, ref Guid riid, ref IntPtr ppv);
-        [PreserveSig] int Clone(ref Guid riid, ref IntPtr ppv);
-        [PreserveSig] int GetImageRect(int i, IntPtr prc);
-        [PreserveSig] int GetIconSize(ref int cx, ref int cy);
-        [PreserveSig] int SetIconSize(int cx, int cy);
-        [PreserveSig] int GetImageCount(ref int pi);
-        [PreserveSig] int SetImageCount(int uNewCount);
-        [PreserveSig] int SetBkColor(int clrBk, ref int pclr);
-        [PreserveSig] int GetBkColor(ref int pclr);
-        [PreserveSig] int BeginDrag(int iTrack, int dxHotspot, int dyHotspot);
-        [PreserveSig] int EndDrag();
-        [PreserveSig] int DragEnter(IntPtr hwndLock, int x, int y);
-        [PreserveSig] int DragLeave(IntPtr hwndLock);
-        [PreserveSig] int DragMove(int x, int y);
-        [PreserveSig] int SetDragCursorImage(
-            ref IImageList punk,
-            int iDrag,
-            int dxHotspot,
-            int dyHotspot
-        );
-        [PreserveSig] int DragShowNolock(int fShow);
-        [PreserveSig] int GetDragImage(
-            IntPtr ppt,
-            IntPtr pptHotspot,
-            ref Guid riid,
-            ref IntPtr ppv
-        );
-        [PreserveSig] int GetItemFlags(int i, ref int dwFlags);
-        [PreserveSig] int GetOverlayImage(int iOverlay, ref int piIndex);
-    }
-
-    public static Bitmap GetIcon(string path, bool directory)
-    {
-        SHFILEINFO info;
-
-        uint attrs = directory
-            ? FILE_ATTRIBUTE_DIRECTORY
-            : FILE_ATTRIBUTE_NORMAL;
-
-        IntPtr result = SHGetFileInfo(
-            path,
-            attrs,
-            out info,
-            (uint)Marshal.SizeOf(typeof(SHFILEINFO)),
-            SHGFI_SYSICONINDEX | SHGFI_LARGEICON
-        );
-
-        if (result == IntPtr.Zero)
-            return null;
-
-        Guid iid =
-            new Guid("46EB5926-582E-4017-9FDF-E8998DAA0950");
-
-        IImageList imageList = null;
-
-        int hr = SHGetImageList(
-            SHIL_JUMBO,
-            ref iid,
-            ref imageList
-        );
-
-        if (hr != 0 || imageList == null)
-            return null;
-
-        IntPtr hIcon = IntPtr.Zero;
-
         try
         {
-            hr = imageList.GetIcon(
-                info.iIcon,
-                ILD_TRANSPARENT | ILD_IMAGE,
-                ref hIcon
-            );
+            SHFILEINFO shinfo = new SHFILEINFO();
+            uint attrs = isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
 
-            if (hr != 0 || hIcon == IntPtr.Zero)
+            // Try real file first (no USEFILEATTRIBUTES)
+            uint flags = SHGFI_ICON | SHGFI_LARGEICON;
+            IntPtr hImg = SHGetFileInfo(path, 0, ref shinfo,
+                (uint)Marshal.SizeOf(typeof(SHFILEINFO)), flags);
+
+            if (hImg == IntPtr.Zero || shinfo.hIcon == IntPtr.Zero)
+            {
+                // Fallback with attributes
+                shinfo = new SHFILEINFO();
+                flags = SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES;
+                hImg = SHGetFileInfo(path, attrs, ref shinfo,
+                    (uint)Marshal.SizeOf(typeof(SHFILEINFO)), flags);
+            }
+
+            if (hImg == IntPtr.Zero || shinfo.hIcon == IntPtr.Zero)
                 return null;
 
-            using (Icon icon = Icon.FromHandle(hIcon))
+            try
             {
-                return icon.ToBitmap();
+                using (Icon icon = Icon.FromHandle(shinfo.hIcon))
+                {
+                    return new Bitmap(icon.ToBitmap());
+                }
+            }
+            finally
+            {
+                DestroyIcon(shinfo.hIcon);
             }
         }
-        finally
+        catch
         {
-            if (hIcon != IntPtr.Zero)
-                DestroyIcon(hIcon);
+            return null;
         }
     }
 }
-'@ -ReferencedAssemblies @(
-    "System.Drawing",
-    "System.Windows.Forms"
-)
+'@ -ReferencedAssemblies @("System.Drawing")
 
 # ============================================================
 # 016 - RESIZE ICON
@@ -668,55 +622,36 @@ function Resize-IconBitmap {
         [int]$Size
     )
 
-    if ($null -eq $Source) {
+    if ($null -eq $Source -or $Size -lt 8) {
         return $null
     }
 
     try {
-
         $result = New-Object System.Drawing.Bitmap(
-            $Size,
-            $Size,
+            $Size, $Size,
             [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
         )
-
         $g = [System.Drawing.Graphics]::FromImage($result)
-
         try {
-
             $g.Clear([System.Drawing.Color]::Transparent)
-
-            $g.CompositingMode =
-                [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
-
-            $g.CompositingQuality =
-                [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
-
-            $g.InterpolationMode =
-                [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
 
             $ratio = [Math]::Min(
                 $Size / [double]$Source.Width,
                 $Size / [double]$Source.Height
             )
-
-            $w = [int]($Source.Width * $ratio)
-            $h = [int]($Source.Height * $ratio)
-
+            $w = [Math]::Max(1, [int]($Source.Width * $ratio))
+            $h = [Math]::Max(1, [int]($Source.Height * $ratio))
             $x = [int](($Size - $w) / 2)
             $y = [int](($Size - $h) / 2)
-
-            $g.DrawImage(
-                $Source,
-                (New-Object System.Drawing.Rectangle(
-                    $x,$y,$w,$h
-                ))
-            )
+            $g.DrawImage($Source, $x, $y, $w, $h)
         }
         finally {
             $g.Dispose()
         }
-
         return $result
     }
     catch {
@@ -731,31 +666,35 @@ function Resize-IconBitmap {
 function Get-DesktopIcon {
 
     param(
-        [System.IO.FileInfo]$Item,
+        [System.IO.FileSystemInfo]$Item,
         [int]$Size
     )
 
     $raw = $null
 
     try {
-        $raw = [WindowsJumboIcons]::GetIcon(
-            $Item.FullName,
-            $Item.PSIsContainer
-        )
+        $raw = [ShellIcons]::GetIcon([string]$Item.FullName, [bool]$Item.PSIsContainer)
     }
-    catch {
+    catch { }
+
+    if ($null -eq $raw -and -not $Item.PSIsContainer) {
+        try {
+            $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($Item.FullName)
+            if ($null -ne $ico) {
+                $raw = $ico.ToBitmap()
+                $ico.Dispose()
+            }
+        }
+        catch { }
     }
 
     if ($null -eq $raw) {
-
         try {
             if ($Item.PSIsContainer) {
-                $raw =
-                    [System.Drawing.SystemIcons]::WinLogo.ToBitmap()
+                $raw = [System.Drawing.SystemIcons]::WinLogo.ToBitmap()
             }
             else {
-                $raw =
-                    [System.Drawing.SystemIcons]::Application.ToBitmap()
+                $raw = [System.Drawing.SystemIcons]::Application.ToBitmap()
             }
         }
         catch {
@@ -764,13 +703,7 @@ function Get-DesktopIcon {
     }
 
     $scaled = Resize-IconBitmap $raw $Size
-
-    try {
-        $raw.Dispose()
-    }
-    catch {
-    }
-
+    try { $raw.Dispose() } catch { }
     return $scaled
 }
 
@@ -1257,7 +1190,7 @@ function New-DesktopFolder {
                 $name = "New Folder ($number)"
             }
 
-            $path = Join-Path $desktopPath $name
+            $path = Join-Path $script:desktopPath $name
             $number++
 
         }
@@ -1294,7 +1227,7 @@ function New-DesktopTextFile {
                 $name = "New Text Document ($number).txt"
             }
 
-            $path = Join-Path $desktopPath $name
+            $path = Join-Path $script:desktopPath $name
             $number++
 
         }
@@ -1535,35 +1468,33 @@ function Refresh-Desktop {
 
 function Reset-DesktopSettings {
 
-    $settings.BackgroundType =
-        $defaultSettings.BackgroundType
+    # Completely delete settings.json so nothing stale remains
+    try {
+        if (Test-Path -LiteralPath $settingsFile) {
+            Remove-Item -LiteralPath $settingsFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch { }
 
-    $settings.BackgroundColor =
-        $defaultSettings.BackgroundColor
-
-    $settings.ImagePath =
-        $defaultSettings.ImagePath
-
-    $settings.ImageMode =
-        $defaultSettings.ImageMode
-
-    $settings.IconScale =
-        $defaultSettings.IconScale
-
-    $settings.Positions = @{}
+    $settings.BackgroundType  = $defaultSettings.BackgroundType
+    $settings.BackgroundColor = $defaultSettings.BackgroundColor
+    $settings.ImagePath       = $defaultSettings.ImagePath
+    $settings.ImageMode       = $defaultSettings.ImageMode
+    $settings.IconScale       = $defaultSettings.IconScale
+    $settings.DesktopPath     = Join-Path $env:USERPROFILE "Desktop"
+    $settings.Positions       = @{}
 
     $script:selectedPath = $null
+    $script:desktopPath  = $settings.DesktopPath
+    $desktopPath         = $settings.DesktopPath
 
+    # Write a clean settings file
     Save-DesktopSettings
 
     Load-BackgroundImage
 
     foreach ($form in $script:forms) {
-
-        if (
-            $null -ne $form -and
-            -not $form.IsDisposed
-        ) {
+        if ($null -ne $form -and -not $form.IsDisposed) {
             Apply-Background $form
         }
     }
@@ -1591,7 +1522,7 @@ function Show-Settings {
 
     $sf.Text = "Emulated Desktop - Settings"
     $sf.Width = 560
-    $sf.Height = 620
+    $sf.Height = 720
 
     $sf.StartPosition =
         [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -1869,6 +1800,80 @@ function Show-Settings {
 
     $sf.Controls.Add($currentLabel)
 
+    # DESKTOP PATH TITLE
+
+    $pathTitle =
+        New-Object System.Windows.Forms.Label
+
+    $pathTitle.Text = "DESKTOP FOLDER"
+    $pathTitle.Left = 28
+    $pathTitle.Top = 330
+    $pathTitle.AutoSize = $true
+
+    $pathTitle.ForeColor =
+        [System.Drawing.Color]::FromArgb(95,160,230)
+
+    $pathTitle.Font =
+        New-Object System.Drawing.Font(
+            "Segoe UI",
+            9,
+            [System.Drawing.FontStyle]::Bold
+        )
+
+    $sf.Controls.Add($pathTitle)
+
+    $pathBox =
+        New-Object System.Windows.Forms.TextBox
+
+    $pathBox.Left = 28
+    $pathBox.Top = 355
+    $pathBox.Width = 380
+    $pathBox.Height = 28
+    $pathBox.Text = [string]$settings.DesktopPath
+
+    $sf.Controls.Add($pathBox)
+
+    $browsePathButton =
+        New-Object System.Windows.Forms.Button
+
+    $browsePathButton.Text = "Browse..."
+    $browsePathButton.Left = 418
+    $browsePathButton.Top = 352
+    $browsePathButton.Width = 100
+    $browsePathButton.Height = 32
+
+    $browsePathButton.BackColor = $script:Colors.Button
+    $browsePathButton.ForeColor = $script:Colors.Text
+    $browsePathButton.FlatStyle =
+        [System.Windows.Forms.FlatStyle]::Flat
+    $browsePathButton.FlatAppearance.BorderSize = 0
+
+    $browsePathButton.Add_Click({
+        $folderDialog =
+            New-Object System.Windows.Forms.FolderBrowserDialog
+        $folderDialog.Description =
+            "Select the folder to use as the emulated Desktop"
+        $folderDialog.ShowNewFolderButton = $true
+
+        if (
+            -not [string]::IsNullOrWhiteSpace($pathBox.Text) -and
+            (Test-Path -LiteralPath $pathBox.Text)
+        ) {
+            $folderDialog.SelectedPath = $pathBox.Text
+        }
+
+        if (
+            $folderDialog.ShowDialog() -eq
+            [System.Windows.Forms.DialogResult]::OK
+        ) {
+            $pathBox.Text = $folderDialog.SelectedPath
+        }
+
+        $folderDialog.Dispose()
+    })
+
+    $sf.Controls.Add($browsePathButton)
+
     # ICON TITLE
 
     $iconTitle =
@@ -1876,7 +1881,7 @@ function Show-Settings {
 
     $iconTitle.Text = "ICON SIZE"
     $iconTitle.Left = 28
-    $iconTitle.Top = 343
+    $iconTitle.Top = 400
     $iconTitle.AutoSize = $true
 
     $iconTitle.ForeColor =
@@ -1897,7 +1902,7 @@ function Show-Settings {
         New-Object System.Windows.Forms.TrackBar
 
     $iconSlider.Left = 28
-    $iconSlider.Top = 370
+    $iconSlider.Top = 428
     $iconSlider.Width = 350
 
     $iconSlider.Minimum = 48
@@ -1914,7 +1919,7 @@ function Show-Settings {
         "$($iconSlider.Value) px"
 
     $iconSizeLabel.Left = 395
-    $iconSizeLabel.Top = 376
+    $iconSizeLabel.Top = 434
     $iconSizeLabel.Width = 100
 
     $iconSizeLabel.ForeColor = $script:Colors.Text
@@ -1938,9 +1943,9 @@ function Show-Settings {
         "F2 renames the selected icon."
 
     $info.Left = 28
-    $info.Top = 420
+    $info.Top = 475
     $info.Width = 480
-    $info.Height = 60
+    $info.Height = 50
 
     $info.ForeColor = $script:Colors.Muted
 
@@ -1953,7 +1958,7 @@ function Show-Settings {
 
     $reset.Text = "Revert to Defaults"
     $reset.Left = 28
-    $reset.Top = 485
+    $reset.Top = 540
     $reset.Width = 180
     $reset.Height = 38
 
@@ -1970,7 +1975,7 @@ function Show-Settings {
 
         $answer =
             [System.Windows.Forms.MessageBox]::Show(
-                "Reset wallpaper, icon size and icon positions?",
+                "This will DELETE all saved settings (path, wallpaper, icon size, positions) and restore defaults. Continue?",
                 "Revert to Defaults",
                 [System.Windows.Forms.MessageBoxButtons]::YesNo,
                 [System.Windows.Forms.MessageBoxIcon]::Question
@@ -1996,6 +2001,9 @@ function Show-Settings {
 
             $currentLabel.Text =
                 "No image selected"
+
+            $pathBox.Text =
+                [string]$defaultSettings.DesktopPath
         }
     })
 
@@ -2008,7 +2016,7 @@ function Show-Settings {
 
     $cancel.Text = "Cancel"
     $cancel.Left = 218
-    $cancel.Top = 485
+    $cancel.Top = 540
     $cancel.Width = 100
     $cancel.Height = 38
 
@@ -2033,7 +2041,7 @@ function Show-Settings {
 
     $apply.Text = "Apply"
     $apply.Left = 328
-    $apply.Top = 485
+    $apply.Top = 540
     $apply.Width = 190
     $apply.Height = 38
 
@@ -2062,6 +2070,18 @@ function Show-Settings {
         $settings.IconScale =
             [int]$iconSlider.Value
 
+        # Desktop folder path (override)
+        $newPath = $pathBox.Text.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($newPath)) {
+            try {
+                $newPath = [Environment]::ExpandEnvironmentVariables($newPath)
+            }
+            catch { }
+            $settings.DesktopPath = $newPath
+            $script:desktopPath = $newPath
+            $desktopPath = $newPath
+        }
+
         Save-AllPositions
         Save-DesktopSettings
 
@@ -2076,6 +2096,18 @@ function Show-Settings {
                 Apply-Background $form
             }
         }
+
+        # Update the path label on the main form
+        try {
+            foreach ($c in $script:primaryForm.Controls) {
+                if ($c -is [System.Windows.Forms.Label] -and
+                    $c.Top -eq 66) {
+                    $c.Text = $script:desktopPath
+                    break
+                }
+            }
+        }
+        catch { }
 
         Build-DesktopIcons
 
@@ -2093,7 +2125,7 @@ function Show-Settings {
         "F5 Refresh    PageUp/PageDown Resize    F2 Rename    ESC Exit"
 
     $shortcuts.Left = 28
-    $shortcuts.Top = 540
+    $shortcuts.Top = 590
     $shortcuts.Width = 500
     $shortcuts.Height = 24
 
@@ -2142,40 +2174,100 @@ function Build-DesktopIcons {
 
         Dispose-DesktopControls
 
-        $items = @()
-
+        # ---- Resolve Desktop path (always classic user Desktop by default) ----
+        $usePath = Join-Path $env:USERPROFILE "Desktop"
         try {
+            $cfg = [string]$settings.DesktopPath
+            if (-not [string]::IsNullOrWhiteSpace($cfg)) {
+                $cfg = [Environment]::ExpandEnvironmentVariables($cfg)
+                if (Test-Path -LiteralPath $cfg) {
+                    $usePath = $cfg
+                }
+            }
+        }
+        catch { }
 
-            $items = @(
-                Get-ChildItem `
-                    -LiteralPath $desktopPath `
-                    -Force `
-                    -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.Name -ne "desktop.ini"
-                } |
-                Sort-Object `
-                    @{Expression={-not $_.PSIsContainer}},
-                    @{Expression={$_.Name}}
-            )
+        $script:desktopPath = $usePath
+        $desktopPath = $usePath
+        $settings.DesktopPath = $usePath
+
+        # ---- List items (simple + fallbacks) ----
+        $items = @()
+        $listError = ""
+        try {
+            $items = @(Get-ChildItem -Path $usePath -Force -ErrorAction Stop |
+                Where-Object { $_.Name -ne "desktop.ini" })
         }
         catch {
-            $items = @()
+            $listError = $_.Exception.Message
+            try {
+                $items = @(Get-ChildItem -LiteralPath $usePath -Force -ErrorAction Stop |
+                    Where-Object { $_.Name -ne "desktop.ini" })
+                $listError = ""
+            }
+            catch {
+                $listError = $_.Exception.Message
+            }
         }
 
+        if ($items.Count -eq 0 -and [System.IO.Directory]::Exists($usePath)) {
+            try {
+                $names = [System.IO.Directory]::GetFileSystemEntries($usePath)
+                $tmp = @()
+                foreach ($e in $names) {
+                    $leaf = [System.IO.Path]::GetFileName($e)
+                    if ($leaf -eq "desktop.ini") { continue }
+                    $fi = Get-Item -LiteralPath $e -Force -ErrorAction SilentlyContinue
+                    if ($null -ne $fi) { $tmp += $fi }
+                }
+                $items = $tmp
+            }
+            catch {
+                if ([string]::IsNullOrWhiteSpace($listError)) {
+                    $listError = $_.Exception.Message
+                }
+            }
+        }
+
+        # Sort: folders first, then name
+        try {
+            $items = @($items | Sort-Object @{Expression={-not $_.PSIsContainer}}, Name)
+        }
+        catch { }
+
+        # ---- Diagnostic label (always visible) ----
+        $diag = New-Object System.Windows.Forms.Label
+        $diag.AutoSize = $false
+        $diag.Width = [Math]::Max(400, $form.ClientSize.Width - 40)
+        $diag.Height = 48
+        $diag.Left = 20
+        $diag.Top = 70
+        $existsStr = if (Test-Path -LiteralPath $usePath) { "YES" } else { "NO" }
+        $diag.Text = ("Path: {0}`r`nExists: {1}   Items: {2}   {3}" -f $usePath, $existsStr, $items.Count, $listError)
+        $diag.ForeColor = [System.Drawing.Color]::FromArgb(180, 200, 220)
+        $diag.BackColor = [System.Drawing.Color]::Transparent
+        $diag.Font = New-Object System.Drawing.Font("Consolas", 9)
+        $diag.Enabled = $false
+        $form.Controls.Add($diag)
+        $script:desktopControls += $diag
+
+        # Update top path label if present
+        try {
+            foreach ($c in $form.Controls) {
+                if ($c -is [System.Windows.Forms.Label] -and $c.Top -eq 66) {
+                    $c.Text = $usePath
+                    break
+                }
+            }
+        }
+        catch { }
+
         $iconSize = [int]$settings.IconScale
+        if ($iconSize -lt 48) { $iconSize = 48 }
+        if ($iconSize -gt 160) { $iconSize = 160 }
 
-        $cellWidth =
-            [Math]::Max(
-                115,
-                $iconSize + 35
-            )
-
-        $cellHeight =
-            [Math]::Max(
-                125,
-                $iconSize + 55
-            )
+        $cellWidth  = [Math]::Max(115, $iconSize + 35)
+        $cellHeight = [Math]::Max(125, $iconSize + 55)
 
         $index = 0
 
@@ -2183,522 +2275,197 @@ function Build-DesktopIcons {
 
             try {
 
-                $path = $item.FullName
+                $path = [string]$item.FullName
+                $name = [string]$item.Name
 
-                $panel =
-                    New-Object System.Windows.Forms.Panel
-
-                $panel.Width =
-                    [int]$cellWidth - 10
-
-                $panel.Height =
-                    [int]$cellHeight
-
-                $panel.BackColor =
-                    $script:Colors.Panel
-
+                $panel = New-Object System.Windows.Forms.Panel
+                $panel.Width  = [int]$cellWidth - 10
+                $panel.Height = [int]$cellHeight
+                $panel.BackColor = $script:Colors.Panel
                 $panel.Tag = $path
-
+                $panel.Visible = $true
                 Enable-DoubleBuffer $panel
 
-                $saved =
-                    Get-SavedPosition $path
+                # Position
+                $maxX = [Math]::Max(0, $form.ClientSize.Width  - $panel.Width - 4)
+                $maxY = [Math]::Max(80, $form.ClientSize.Height - $panel.Height - 30)
 
+                $saved = Get-SavedPosition $path
                 if ($null -ne $saved) {
-
-                    $panel.Left = $saved.X
-                    $panel.Top = $saved.Y
+                    $px = [Math]::Max(0, [Math]::Min($maxX, [int]$saved.X))
+                    $py = [Math]::Max(80, [Math]::Min($maxY, [int]$saved.Y))
+                    $panel.Left = $px
+                    $panel.Top  = $py
                 }
                 else {
-
-                    $position =
-                        Get-FreePosition `
-                            -Index $index `
-                            -CellWidth $cellWidth `
-                            -CellHeight $cellHeight
-
-                    $panel.Left = $position.X
-                    $panel.Top = $position.Y
-
-                    Save-ItemPosition `
-                        -Path $path `
-                        -X $panel.Left `
-                        -Y $panel.Top
+                    $cols = [Math]::Max(1, [int][Math]::Floor(
+                        [Math]::Max(200, $form.ClientSize.Width - 20) / $cellWidth
+                    ))
+                    $col = $index % $cols
+                    $row = [int][Math]::Floor($index / $cols)
+                    $panel.Left = 14 + ($col * $cellWidth)
+                    $panel.Top  = 130 + ($row * $cellHeight)
+                    if ($panel.Left -gt $maxX) { $panel.Left = $maxX }
+                    if ($panel.Top  -gt $maxY) { $panel.Top  = $maxY }
+                    Save-ItemPosition -Path $path -X $panel.Left -Y $panel.Top
                 }
 
-                # ---------------- ICON ----------------
-
-                $picture =
-                    New-Object System.Windows.Forms.PictureBox
-
-                $picture.Width = $iconSize
+                # Icon
+                $picture = New-Object System.Windows.Forms.PictureBox
+                $picture.Width  = $iconSize
                 $picture.Height = $iconSize
-
-                $picture.Left =
-                    [int](($panel.Width - $iconSize) / 2)
-
-                $picture.Top = 5
-
-                $picture.BackColor =
-                    $script:Colors.Panel
-
-                $picture.SizeMode =
-                    [System.Windows.Forms.PictureBoxSizeMode]::CenterImage
-
+                $picture.Left   = [int](($panel.Width - $iconSize) / 2)
+                $picture.Top    = 6
+                $picture.BackColor = $script:Colors.Panel
+                $picture.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
                 $picture.Tag = $path
-
+                $picture.Visible = $true
                 Enable-DoubleBuffer $picture
 
-                $bitmap =
-                    Get-DesktopIcon `
-                        -Item $item `
-                        -Size $iconSize
-
-                if ($null -ne $bitmap) {
-
-                    $picture.Image = $bitmap
-
-                    $script:iconBitmaps += $bitmap
+                try {
+                    $bitmap = Get-DesktopIcon -Item $item -Size $iconSize
+                    if ($null -ne $bitmap) {
+                        $picture.Image = $bitmap
+                        $script:iconBitmaps += $bitmap
+                    }
                 }
+                catch { }
 
-                # ---------------- LABEL ----------------
-
-                $label =
-                    New-Object System.Windows.Forms.Label
-
-                $label.Width = $panel.Width
-                $label.Height = 40
-
-                $label.Left = 0
-                $label.Top = $iconSize + 8
-
-                $label.Text = $item.Name
-
-                $label.ForeColor =
-                    $script:Colors.Text
-
-                $label.BackColor =
-                    $script:Colors.Panel
-
-                $label.Font =
-                    New-Object System.Drawing.Font(
-                        "Segoe UI",
-                        9
-                    )
-
-                $label.TextAlign =
-                    [System.Drawing.ContentAlignment]::TopCenter
-
+                # Label (ALWAYS show the name)
+                $label = New-Object System.Windows.Forms.Label
+                $label.Width  = $panel.Width - 4
+                $label.Height = 42
+                $label.Left   = 2
+                $label.Top    = $iconSize + 10
+                $label.Text   = $name
+                $label.ForeColor = [System.Drawing.Color]::White
+                $label.BackColor = $script:Colors.Panel
+                $label.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+                $label.TextAlign = [System.Drawing.ContentAlignment]::TopCenter
                 $label.AutoEllipsis = $true
                 $label.Tag = $path
+                $label.Visible = $true
 
-                # ====================================================
-                # EVENTS
-                # ====================================================
-
+                # ---- Events (keep simple, avoid capture issues) ----
                 $enter = {
-
-                    param($sender,$e)
-
+                    param($s,$e)
                     try {
-
-                        $target = $sender
-
-                        if (
-                            $target -is
-                            [System.Windows.Forms.PictureBox]
-                        ) {
-                            $target = $target.Parent
+                        $t = $s
+                        if ($t -is [System.Windows.Forms.PictureBox] -or $t -is [System.Windows.Forms.Label]) {
+                            $t = $t.Parent
                         }
-
-                        if (
-                            $target -is
-                            [System.Windows.Forms.Label]
-                        ) {
-                            $target = $target.Parent
+                        if ($null -ne $t) {
+                            $t.BackColor = $script:Colors.PanelHover
+                            foreach ($ch in $t.Controls) { $ch.BackColor = $script:Colors.PanelHover }
                         }
-
-                        Set-ItemHover $target $true
-                    }
-                    catch {
-                    }
+                    } catch {}
                 }
-
                 $leave = {
-
-                    param($sender,$e)
-
+                    param($s,$e)
                     try {
-
-                        $target = $sender
-
-                        if (
-                            $target -is
-                            [System.Windows.Forms.PictureBox]
-                        ) {
-                            $target = $target.Parent
+                        $t = $s
+                        if ($t -is [System.Windows.Forms.PictureBox] -or $t -is [System.Windows.Forms.Label]) {
+                            $t = $t.Parent
                         }
-
-                        if (
-                            $target -is
-                            [System.Windows.Forms.Label]
-                        ) {
-                            $target = $target.Parent
+                        if ($null -ne $t) {
+                            $t.BackColor = $script:Colors.Panel
+                            foreach ($ch in $t.Controls) { $ch.BackColor = $script:Colors.Panel }
                         }
-
-                        Set-ItemHover $target $false
-                    }
-                    catch {
-                    }
+                    } catch {}
                 }
-
-                # ====================================================
-                # DOUBLE CLICK
-                # ====================================================
-
-                $doubleClick = {
-
-                    param($sender,$e)
-
+                $dbl = {
+                    param($s,$e)
                     try {
-
-                        $pathToOpen = [string]$sender.Tag
-
-                        if (
-                            -not [string]::IsNullOrWhiteSpace(
-                                $pathToOpen
-                            )
-                        ) {
-
-                            $script:selectedPath = $pathToOpen
-
-                            Open-DesktopItem $pathToOpen
+                        $p = [string]$s.Tag
+                        if (-not [string]::IsNullOrWhiteSpace($p)) {
+                            $script:selectedPath = $p
+                            Open-DesktopItem $p
                         }
-                    }
-                    catch {
-                    }
+                    } catch {}
                 }
-
-                # ====================================================
-                # RIGHT CLICK
-                # ====================================================
-
-                $rightClick = {
-
-                    param($sender,$e)
-
+                $right = {
+                    param($s,$e)
                     try {
-
-                        if (
-                            $e.Button -ne
-                            [System.Windows.Forms.MouseButtons]::Right
-                        ) {
-                            return
-                        }
-
-                        $pathToOpen = [string]$sender.Tag
-
-                        if (
-                            [string]::IsNullOrWhiteSpace(
-                                $pathToOpen
-                            )
-                        ) {
-                            return
-                        }
-
-                        $script:selectedPath = $pathToOpen
-
-                        $screenPoint =
-                            $sender.PointToScreen(
-                                $e.Location
-                            )
-
-                        Show-ItemContextMenu `
-                            -Path $pathToOpen `
-                            -ScreenPoint $screenPoint
-                    }
-                    catch {
-                    }
+                        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Right) { return }
+                        $p = [string]$s.Tag
+                        if ([string]::IsNullOrWhiteSpace($p)) { return }
+                        $script:selectedPath = $p
+                        Show-ItemContextMenu -Path $p -ScreenPoint ($s.PointToScreen($e.Location))
+                    } catch {}
                 }
-
-                # ====================================================
-                # MOUSE DOWN
-                # ====================================================
-
-                $mouseDown = {
-
-                    param($sender,$e)
-
+                $down = {
+                    param($s,$e)
                     try {
-
-                        if (
-                            $e.Button -ne
-                            [System.Windows.Forms.MouseButtons]::Left
-                        ) {
-                            return
+                        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+                        $t = $s
+                        if ($t -is [System.Windows.Forms.PictureBox] -or $t -is [System.Windows.Forms.Label]) {
+                            $t = $t.Parent
                         }
-
-                        $target = $sender
-
-                        if (
-                            $target -is
-                            [System.Windows.Forms.PictureBox]
-                        ) {
-                            $target = $target.Parent
-                        }
-
-                        if (
-                            $target -is
-                            [System.Windows.Forms.Label]
-                        ) {
-                            $target = $target.Parent
-                        }
-
-                        if ($null -eq $target) {
-                            return
-                        }
-
-                        $path = [string]$target.Tag
-
-                        if ([string]::IsNullOrWhiteSpace($path)) {
-                            return
-                        }
-
-                        # FIX:
-                        # Selection survives mouse release.
-                        $script:selectedPath = $path
-
-                        $screenPoint =
-                            $sender.PointToScreen(
-                                $e.Location
-                            )
-
-                        $localPoint =
-                            $target.PointToClient(
-                                $screenPoint
-                            )
-
-                        $script:dragPanel = $target
-
-                        $script:dragOffset =
-                            New-Object System.Drawing.Point(
-                                $localPoint.X,
-                                $localPoint.Y
-                            )
-
+                        if ($null -eq $t) { return }
+                        $script:selectedPath = [string]$t.Tag
+                        $sp = $s.PointToScreen($e.Location)
+                        $lp = $t.PointToClient($sp)
+                        $script:dragPanel = $t
+                        $script:dragOffset = New-Object System.Drawing.Point($lp.X, $lp.Y)
                         $script:isDragging = $false
-
-                        # FIX:
-                        # Keep mouse events while dragging.
-                        $target.Capture = $true
-
-                        $target.BringToFront()
-
-                        Set-ItemHover `
-                            -Panel $target `
-                            -Hover $true
-                    }
-                    catch {
-                    }
+                        $t.Capture = $true
+                        $t.BringToFront()
+                    } catch {}
                 }
-
-                # ====================================================
-                # MOUSE MOVE
-                # ====================================================
-
-                $mouseMove = {
-
-                    param($sender,$e)
-
+                $move = {
+                    param($s,$e)
                     try {
-
-                        if ($null -eq $script:dragPanel) {
-                            return
-                        }
-
-                        if (
-                            [System.Windows.Forms.Control]::MouseButtons -ne
-                            [System.Windows.Forms.MouseButtons]::Left
-                        ) {
-                            return
-                        }
-
-                        $screenPoint =
-                            [System.Windows.Forms.Cursor]::Position
-
-                        $clientPoint =
-                            $script:primaryForm.PointToClient(
-                                $screenPoint
-                            )
-
-                        $newX =
-                            $clientPoint.X -
-                            $script:dragOffset.X
-
-                        $newY =
-                            $clientPoint.Y -
-                            $script:dragOffset.Y
-
-                        if (
-                            [Math]::Abs(
-                                $newX -
-                                $script:dragPanel.Left
-                            ) -gt 2 -or
-                            [Math]::Abs(
-                                $newY -
-                                $script:dragPanel.Top
-                            ) -gt 2
-                        ) {
+                        if ($null -eq $script:dragPanel) { return }
+                        if ([System.Windows.Forms.Control]::MouseButtons -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+                        $sp = [System.Windows.Forms.Cursor]::Position
+                        $cp = $script:primaryForm.PointToClient($sp)
+                        $nx = $cp.X - $script:dragOffset.X
+                        $ny = $cp.Y - $script:dragOffset.Y
+                        if ([Math]::Abs($nx - $script:dragPanel.Left) -gt 2 -or [Math]::Abs($ny - $script:dragPanel.Top) -gt 2) {
                             $script:isDragging = $true
                         }
-
-                        if ($newX -lt 0) {
-                            $newX = 0
-                        }
-
-                        if ($newY -lt 76) {
-                            $newY = 76
-                        }
-
-                        $maxX =
-                            [Math]::Max(
-                                0,
-                                $script:primaryForm.ClientSize.Width -
-                                $script:dragPanel.Width
-                            )
-
-                        $maxY =
-                            [Math]::Max(
-                                76,
-                                $script:primaryForm.ClientSize.Height -
-                                $script:dragPanel.Height -
-                                8
-                            )
-
-                        if ($newX -gt $maxX) {
-                            $newX = $maxX
-                        }
-
-                        if ($newY -gt $maxY) {
-                            $newY = $maxY
-                        }
-
-                        $script:dragPanel.Left = $newX
-                        $script:dragPanel.Top = $newY
-
-                        $script:dragPanel.Invalidate()
-                    }
-                    catch {
-                    }
+                        $mx = [Math]::Max(0, $script:primaryForm.ClientSize.Width - $script:dragPanel.Width)
+                        $my = [Math]::Max(80, $script:primaryForm.ClientSize.Height - $script:dragPanel.Height - 8)
+                        if ($nx -lt 0) { $nx = 0 }
+                        if ($ny -lt 80) { $ny = 80 }
+                        if ($nx -gt $mx) { $nx = $mx }
+                        if ($ny -gt $my) { $ny = $my }
+                        $script:dragPanel.Left = $nx
+                        $script:dragPanel.Top  = $ny
+                    } catch {}
                 }
-
-                # ====================================================
-                # MOUSE UP
-                # ====================================================
-
-                $mouseUp = {
-
-                    param($sender,$e)
-
+                $up = {
+                    param($s,$e)
                     try {
-
-                        if (
-                            $e.Button -ne
-                            [System.Windows.Forms.MouseButtons]::Left
-                        ) {
-                            return
-                        }
-
+                        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
                         if ($null -ne $script:dragPanel) {
-
-                            $panel = $script:dragPanel
-
-                            try {
-                                $panel.Capture = $false
-                            }
-                            catch {
-                            }
-
-                            $pathToSave =
-                                [string]$panel.Tag
-
-                            if (
-                                -not [string]::IsNullOrWhiteSpace(
-                                    $pathToSave
-                                )
-                            ) {
-
-                                Save-ItemPosition `
-                                    -Path $pathToSave `
-                                    -X $panel.Left `
-                                    -Y $panel.Top
-
-                                $script:selectedPath =
-                                    $pathToSave
+                            try { $script:dragPanel.Capture = $false } catch {}
+                            $p = [string]$script:dragPanel.Tag
+                            if (-not [string]::IsNullOrWhiteSpace($p)) {
+                                Save-ItemPosition -Path $p -X $script:dragPanel.Left -Y $script:dragPanel.Top
+                                $script:selectedPath = $p
                             }
                         }
-
-                        $script:dragPanel = $null
-                        $script:dragOffset = $null
-                        $script:isDragging = $false
-                    }
-                    catch {
-
-                        try {
-                            if ($null -ne $script:dragPanel) {
-                                $script:dragPanel.Capture = $false
-                            }
-                        }
-                        catch {
-                        }
-
-                        $script:dragPanel = $null
-                        $script:dragOffset = $null
-                        $script:isDragging = $false
-                    }
+                    } catch {}
+                    $script:dragPanel = $null
+                    $script:dragOffset = $null
+                    $script:isDragging = $false
                 }
 
-                # ====================================================
-                # ATTACH EVENTS
-                # ====================================================
-
-                $panel.Add_MouseEnter($enter)
-                $panel.Add_MouseLeave($leave)
-
-                $picture.Add_MouseEnter($enter)
-                $picture.Add_MouseLeave($leave)
-
-                $label.Add_MouseEnter($enter)
-                $label.Add_MouseLeave($leave)
-
-                $panel.Add_MouseDown($mouseDown)
-                $panel.Add_MouseMove($mouseMove)
-                $panel.Add_MouseUp($mouseUp)
-
-                $picture.Add_MouseDown($mouseDown)
-                $picture.Add_MouseMove($mouseMove)
-                $picture.Add_MouseUp($mouseUp)
-
-                $label.Add_MouseDown($mouseDown)
-                $label.Add_MouseMove($mouseMove)
-                $label.Add_MouseUp($mouseUp)
-
-                $panel.Add_MouseDoubleClick($doubleClick)
-                $picture.Add_MouseDoubleClick($doubleClick)
-                $label.Add_MouseDoubleClick($doubleClick)
-
-                $panel.Add_MouseUp($rightClick)
-                $picture.Add_MouseUp($rightClick)
-                $label.Add_MouseUp($rightClick)
-
-                # ====================================================
-                # CONTROLS
-                # ====================================================
+                foreach ($ctl in @($panel, $picture, $label)) {
+                    $ctl.Add_MouseEnter($enter)
+                    $ctl.Add_MouseLeave($leave)
+                    $ctl.Add_MouseDoubleClick($dbl)
+                    $ctl.Add_MouseUp($right)
+                    $ctl.Add_MouseDown($down)
+                    $ctl.Add_MouseMove($move)
+                    $ctl.Add_MouseUp($up)
+                }
 
                 $panel.Controls.Add($picture)
                 $panel.Controls.Add($label)
-
                 $form.Controls.Add($panel)
+                $panel.BringToFront()
 
                 $script:desktopPanels += $panel
                 $script:desktopControls += $picture
@@ -2707,8 +2474,18 @@ function Build-DesktopIcons {
                 $index++
             }
             catch {
+                # keep going - do not abort other icons
             }
         }
+
+        # Update diagnostic with panels actually created
+        try {
+            if ($null -ne $diag -and -not $diag.IsDisposed) {
+                $diag.Text = ("Path: {0}`r`nExists: {1}   Listed: {2}   Shown: {3}   {4}" -f $usePath, $existsStr, $items.Count, $index, $listError)
+                $diag.BringToFront()
+            }
+        }
+        catch { }
 
         # ========================================================
         # STATUS
@@ -2718,7 +2495,7 @@ function Build-DesktopIcons {
             New-Object System.Windows.Forms.Label
 
         $status.Text =
-            "$index items    |    F5 Refresh    |    PageUp/PageDown Resize    |    F2 Rename"
+            "Shown: $index / Listed: $($items.Count)  |  $usePath  |  F5  |  PgUp/PgDn  |  F2  |  ESC"
 
         $status.Left = 20
 
@@ -2762,49 +2539,32 @@ function Build-DesktopIcons {
 }
 
 # ============================================================
-# 036 - CREATE FORMS
+# 036 - CREATE FORMS (ALL SCREENS)
 # ============================================================
 
-$screens =
-    [System.Windows.Forms.Screen]::AllScreens
+$screens = [System.Windows.Forms.Screen]::AllScreens
 
 foreach ($screen in $screens) {
 
-    $form =
-        New-Object System.Windows.Forms.Form
+    $form = New-Object System.Windows.Forms.Form
 
-    $form.FormBorderStyle =
-        [System.Windows.Forms.FormBorderStyle]::None
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $form.StartPosition   = [System.Windows.Forms.FormStartPosition]::Manual
 
-    $form.StartPosition =
-        [System.Windows.Forms.FormStartPosition]::Manual
-
-    $form.Left =
-        $screen.WorkingArea.Left
-
-    $form.Top =
-        $screen.WorkingArea.Top
-
-    $form.Width =
-        $screen.WorkingArea.Width
-
-    $form.Height =
-        $screen.WorkingArea.Height
+    $form.Left   = $screen.WorkingArea.Left
+    $form.Top    = $screen.WorkingArea.Top
+    $form.Width  = $screen.WorkingArea.Width
+    $form.Height = $screen.WorkingArea.Height
 
     $form.ShowInTaskbar = $false
-    $form.KeyPreview = $true
-
-    $form.Text = "Emulated Desktop"
-
-    $form.BackColor =
-        $script:Colors.Background
+    $form.KeyPreview    = $true
+    $form.Text          = "Emulated Desktop"
+    $form.BackColor     = $script:Colors.Background
 
     Enable-DoubleBuffer $form
 
     $form.Add_Paint({
-
-        param($sender,$e)
-
+        param($sender, $e)
         Paint-DesktopBackground $e
     })
 
@@ -2815,18 +2575,13 @@ foreach ($screen in $screens) {
 # 037 - PRIMARY FORM
 # ============================================================
 
-$primaryScreen =
-    [System.Windows.Forms.Screen]::PrimaryScreen
+$primaryScreen = [System.Windows.Forms.Screen]::PrimaryScreen
 
 foreach ($form in $script:forms) {
-
     if (
-        $form.Left -eq
-        $primaryScreen.WorkingArea.Left -and
-        $form.Top -eq
-        $primaryScreen.WorkingArea.Top
+        $form.Left -eq $primaryScreen.WorkingArea.Left -and
+        $form.Top  -eq $primaryScreen.WorkingArea.Top
     ) {
-
         $script:primaryForm = $form
         break
     }
@@ -2940,7 +2695,7 @@ $pathLabel =
     New-Object System.Windows.Forms.Label
 
 $pathLabel.Text =
-    $desktopPath
+    $script:desktopPath
 
 $pathLabel.Left = 20
 $pathLabel.Top = 66
@@ -3130,27 +2885,33 @@ foreach ($form in $script:forms) {
     Apply-Background $form
 }
 
-Build-DesktopIcons
-
 # ============================================================
-# 046 - SHOW
+# 046 - SHOW (build icons AFTER form is visible)
 # ============================================================
 
 foreach ($form in $script:forms) {
-
     try {
         $form.Show()
     }
-    catch {
-    }
+    catch { }
 }
+
+# Force layout so ClientSize is real
+try {
+    $script:primaryForm.PerformLayout()
+    $script:primaryForm.Update()
+}
+catch { }
+
+Build-DesktopIcons
+
+# (icons already built after Show)
 
 # ============================================================
 # 047 - RUN
 # ============================================================
 
 try {
-
     [System.Windows.Forms.Application]::Run(
         $script:primaryForm
     )
