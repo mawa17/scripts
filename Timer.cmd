@@ -80,10 +80,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "        $maxX = [math]::Floor(($vs.Right - $panel.Width) / $gridSize) * $gridSize;" ^
     "        $minY = [math]::Floor($vs.Top / $gridSize) * $gridSize;" ^
     "        $maxY = [math]::Floor(($vs.Bottom - $panel.Height) / $gridSize) * $gridSize;" ^
-    "        if ($script:currentX -lt $minX) { $script:currentX = $minX }" ^
-    "        if ($script:currentX -gt $maxX) { $script:currentX = $maxX }" ^
-    "        if ($script:currentY -lt $minY) { $script:currentY = $minY }" ^
-    "        if ($script:currentY -gt $maxY) { $script:currentY = $maxY }" ^
+    "        if ($script:currentX -lt $minX) { $script:currentX = $minX };" ^
+    "        if ($script:currentX -gt $maxX) { $script:currentX = $maxX };" ^
+    "        if ($script:currentY -lt $minY) { $script:currentY = $minY };" ^
+    "        if ($script:currentY -gt $maxY) { $script:currentY = $maxY };" ^
     "        $panel.Left = $script:currentX - $vs.Left;" ^
     "        $panel.Top = $script:currentY - $vs.Top;" ^
     "    };" ^
@@ -91,11 +91,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "    $form.add_KeyDown({ " ^
     "        param($sender, $e);" ^
     "        $key = $e.KeyCode;" ^
-    "        if ($key -eq [System.Windows.Forms.Keys]::Escape) { $form.Close() }" ^
-    "        if ($key -eq [System.Windows.Forms.Keys]::Left)  { $script:currentX -= $gridSize; & $updatePosition }" ^
-    "        if ($key -eq [System.Windows.Forms.Keys]::Right) { $script:currentX += $gridSize; & $updatePosition }" ^
-    "        if ($key -eq [System.Windows.Forms.Keys]::Up)    { $script:currentY -= $gridSize; & $updatePosition }" ^
-    "        if ($key -eq [System.Windows.Forms.Keys]::Down)  { $script:currentY += $gridSize; & $updatePosition }" ^
+    "        if ($key -eq [System.Windows.Forms.Keys]::Escape) { $form.Close() };" ^
+    "        if ($key -eq [System.Windows.Forms.Keys]::Left)  { $script:currentX -= $gridSize; & $updatePosition };" ^
+    "        if ($key -eq [System.Windows.Forms.Keys]::Right) { $script:currentX += $gridSize; & $updatePosition };" ^
+    "        if ($key -eq [System.Windows.Forms.Keys]::Up)    { $script:currentY -= $gridSize; & $updatePosition };" ^
+    "        if ($key -eq [System.Windows.Forms.Keys]::Down)  { $script:currentY += $gridSize; & $updatePosition };" ^
     "        if ($key -eq [System.Windows.Forms.Keys]::Prior) {" ^
     "            if ($script:fontSize -lt 60) {" ^
     "                $script:fontSize += 4;" ^
@@ -125,6 +125,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "            shutdown.exe /s /f /t 0;" ^
     "            $form.Close();" ^
     "        } else {" ^
+    "            if ($diff.TotalSeconds -le 60) {" ^
+    "                $label.ForeColor = [System.Drawing.Color]::Red;" ^
+    "            } else {" ^
+    "                $label.ForeColor = [System.Drawing.Color]::White;" ^
+    "            }" ^
     "            $totalHours = [Math]::Floor($diff.TotalHours);" ^
     "            $label.Text = '{0:D2}:{1:D2}:{2:D2}' -f [int]$totalHours, $diff.Minutes, $diff.Seconds;" ^
     "        }" ^
